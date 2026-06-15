@@ -1,0 +1,327 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// LCD 설정
+// 안 나오면 0x27을 0x3F로 바꿔보기
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+Servo lidServo;
+
+// 핀 설정
+const int trigPin = 9;
+const int echoPin = 10;
+const int servoPin = 6;
+const int ledPin = 7;
+
+const int soundAnalogPin = A0;  // 소리 센서 AO
+
+// 거리 기준
+const int nearDistance = 20;  // 20cm 이내면 가까이 있음
+const int farDistance = 30;   // 30cm 이상이면 멀어진 것으로 판단
+
+// 서보 각도
+// 기존 130도 -> 0도 이동이 너무 컸으므로
+// 130도 -> 50도, 약 80도만 이동
+const int closeAngle = 130;
+const int openAngle = 20;
+
+// 소리 감지 기준
+// 감지가 안 되면 3으로 낮추기
+// 너무 쉽게 열리면 8, 10, 15로 올리기
+const float soundThreshold = 7;
+
+// 소리 측정 시간
+const unsigned long soundSampleWindow = 25;
+
+// 같은 소리 중복 감지 방지
+const unsigned long soundCooldown = 700;
+
+// 사람이 멀어진 상태가 이 시간 유지되면 닫힘
+const unsigned long farStableTime = 1200;
+
+// LCD / 시리얼 출력 간격
+const unsigned long lcdUpdateInterval = 300;
+const unsigned long serialUpdateInterval = 200;
+
+// 상태 변수
+bool isOpen = false;
+
+unsigned long lastSoundTime = 0;
+unsigned long farStartTime = 0;
+
+unsigned long lastLcdUpdate = 0;
+unsigned long lastSerialUpdate = 0;
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+
+  lidServo.attach(servoPin);
+  lidServo.write(closeAngle);
+
+  digitalWrite(ledPin, LOW);
+
+  lcd.init();
+  lcd.backlight();
+
+  printLine(0, "Fish Trash Can");
+  printLine(1, "System Ready");
+
+  Serial.println("====================================");
+  Serial.println("Fish Trash Can Debug Start");
+  Serial.println("Condition: Near + Sound Once = Open");
+  Serial.println("Servo: close 130, open 50");
+  Serial.println("Sound AO -> A0");
+  Serial.println("====================================");
+
+  delay(1200);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  float distance = measureDistanceCm();
+
+  bool personNear = false;
+  bool personFar = false;
+
+  if (distance > 0 && distance <= nearDistance) {
+    personNear = true;
+  }
+
+  if (distance > 0 && distance >= farDistance) {
+    personFar = true;
+  }
+
+  int soundLevel = readSoundLevel();
+  bool soundDetected = soundLevel >= soundThreshold;
+
+  // =========================
+  // 닫혀 있는 상태
+  // 가까이 있는 상태에서 소리 한 번만 감지되면 열림
+  // =========================
+  if (!isOpen) {
+    if (personNear && soundDetected && now - lastSoundTime >= soundCooldown) {
+      lastSoundTime = now;
+
+      printLine(0, "Sound Detected");
+      printLine(1, "Opening...");
+
+      Serial.println(">>> SOUND DETECTED");
+      Serial.println(">>> LID OPEN CONDITION SUCCESS");
+
+      openLid();
+    }
+  }
+
+  // =========================
+  // 열려 있는 상태
+  // 사람이 멀어질 때까지 열림 유지
+  // =========================
+  if (isOpen) {
+    if (distance > 0 && distance < farDistance) {
+      farStartTime = 0;
+    }
+
+    if (personFar) {
+      if (farStartTime == 0) {
+        farStartTime = now;
+      }
+
+      if (now - farStartTime >= farStableTime) {
+        closeLid();
+      }
+    }
+  }
+
+  // LCD 업데이트
+  if (now - lastLcdUpdate >= lcdUpdateInterval) {
+    updateLCD(distance, personNear, soundLevel, soundDetected);
+    lastLcdUpdate = now;
+  }
+
+  // 시리얼 모니터 출력
+  if (now - lastSerialUpdate >= serialUpdateInterval) {
+    printSerialDebug(distance, soundLevel, soundDetected, personNear);
+    lastSerialUpdate = now;
+  }
+
+  delay(20);
+}
+
+// 거리 측정 함수
+float measureDistanceCm() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 12000);
+
+  if (duration == 0) {
+    return -1;
+  }
+
+  float distance = duration * 0.0343 / 2;
+
+  if (distance < 2 || distance > 200) {
+    return -1;
+  }
+
+  return distance;
+}
+
+// 소리 측정 함수
+// 25ms 동안 AO의 최대값-최소값 차이를 측정
+int readSoundLevel() {
+  int minValue = 1023;
+  int maxValue = 0;
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < soundSampleWindow) {
+    int value = analogRead(soundAnalogPin);
+
+    if (value < minValue) {
+      minValue = value;
+    }
+
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+
+  return maxValue - minValue;
+}
+
+// 뚜껑 열기
+void openLid() {
+  smoothServoMove(closeAngle, openAngle);
+
+  digitalWrite(ledPin, HIGH);
+  isOpen = true;
+  farStartTime = 0;
+
+  printLine(0, "Status: OPEN");
+  printLine(1, "Stay Near");
+}
+
+// 뚜껑 닫기
+void closeLid() {
+  smoothServoMove(openAngle, closeAngle);
+
+  digitalWrite(ledPin, LOW);
+  isOpen = false;
+  farStartTime = 0;
+
+  printLine(0, "Status: CLOSED");
+  printLine(1, "Thank You!");
+
+  Serial.println(">>> LID CLOSE");
+
+  delay(700);
+}
+
+// 서보 부드럽게 이동
+void smoothServoMove(int fromAngle, int toAngle) {
+  if (fromAngle < toAngle) {
+    for (int angle = fromAngle; angle <= toAngle; angle += 2) {
+      lidServo.write(angle);
+      delay(10);
+    }
+  } else {
+    for (int angle = fromAngle; angle >= toAngle; angle -= 2) {
+      lidServo.write(angle);
+      delay(10);
+    }
+  }
+
+  lidServo.write(toAngle);
+}
+
+// LCD 한 줄 출력
+void printLine(int row, String text) {
+  lcd.setCursor(0, row);
+
+  if (text.length() > 16) {
+    text = text.substring(0, 16);
+  }
+
+  lcd.print(text);
+
+  for (int i = text.length(); i < 16; i++) {
+    lcd.print(" ");
+  }
+}
+
+// LCD 상태 표시
+void updateLCD(float distance, bool personNear, int soundLevel, bool soundDetected) {
+  if (isOpen) {
+    printLine(0, "Status: OPEN");
+
+    if (distance > 0) {
+      printLine(1, "Dist:" + String((int)distance) + "cm");
+    } else {
+      printLine(1, "Dist: --cm");
+    }
+
+    return;
+  }
+
+  if (!personNear) {
+    printLine(0, "Waiting Person");
+
+    if (distance > 0) {
+      printLine(1, "Dist:" + String((int)distance) + "cm");
+    } else {
+      printLine(1, "Dist: --cm");
+    }
+
+    return;
+  }
+
+  if (personNear && !soundDetected) {
+    printLine(0, "Person Detected");
+    printLine(1, "Make Sound Once");
+    return;
+  }
+
+  if (personNear && soundDetected) {
+    printLine(0, "Sound Detected");
+    printLine(1, "Opening...");
+    return;
+  }
+}
+
+// 시리얼 모니터 출력
+void printSerialDebug(float distance, int soundLevel, bool soundDetected, bool personNear) {
+  Serial.print("Distance: ");
+
+  if (distance > 0) {
+    Serial.print(distance);
+    Serial.print(" cm");
+  } else {
+    Serial.print("-- cm");
+  }
+
+  Serial.print(" | SoundLevel: ");
+  Serial.print(soundLevel);
+
+  Serial.print(" | Threshold: ");
+  Serial.print(soundThreshold);
+
+  Serial.print(" | SoundDetected: ");
+  Serial.print(soundDetected ? "YES" : "NO");
+
+  Serial.print(" | Near: ");
+  Serial.print(personNear ? "YES" : "NO");
+
+  Serial.print(" | Lid: ");
+  Serial.println(isOpen ? "OPEN" : "CLOSED");
+}
